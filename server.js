@@ -8,7 +8,7 @@
  *   2. Copy .env.example to .env and paste it in as GEMINI_API_KEY=...
  *   3. That's it — routes/factsheets.js is already wired to call Gemini.
  *
- *   If Google ever retires the "gemini-2.0-flash" free model, check the
+ *   If Google ever retires the "gemini-3.6-flash" free model, check the
  *   current free-tier list at https://ai.google.dev/gemini-api/docs/pricing
  *   and update the MODEL constant near the top of
  *   callClaudeToGenerateFactSheet() in routes/factsheets.js.

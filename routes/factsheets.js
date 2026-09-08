@@ -163,7 +163,7 @@ Generate the fact sheet JSON now.`;
   // Free-tier Gemini Flash model. If this specific model ID ever stops
   // working, check the current free-tier model list at
   // https://ai.google.dev/gemini-api/docs/pricing and swap the name below.
-  const MODEL = "gemini-2.0-flash";
+  const MODEL = "gemini-3.6-flash";
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
 
   const response = await fetch(url, {
