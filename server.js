@@ -21,6 +21,18 @@ const factSheetsRouter = require("./routes/factsheets");
 const app = express();
 app.use(express.json());
 
+// Allow browser-based clients (the demo UI) to call this API from a
+// different origin. Open to any origin for now, since this is a prototype
+// with no real patient data — tighten this to specific domains before any
+// real deployment.
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
 app.use("/api/factsheets", factSheetsRouter);
 
 app.get("/health", (req, res) => res.json({ ok: true }));
