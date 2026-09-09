@@ -1,7 +1,7 @@
 const express = require("express");
 const crypto = require("crypto");
 const { db, logAudit } = require("../db");
-const { lookupMedlinePlus } = require("../lib/grounding");
+const { lookupMedlinePlus, searchRxNorm } = require("../lib/grounding");
 
 const router = express.Router();
 
@@ -9,7 +9,7 @@ const router = express.Router();
 // POST /api/factsheets
 // body: { diagnosis, careContext, readingLevel, language, meds, labs, allergies, dietTags, requestedBy }
 router.post("/", async (req, res) => {
-  const { diagnosis, careContext, readingLevel, language, requestedBy } = req.body;
+  const { diagnosis, careContext, readingLevel, language, requestedBy, meds = [] } = req.body;
   if (!diagnosis || !diagnosis.trim()) {
     return res.status(400).json({ error: "diagnosis is required" });
   }
@@ -17,17 +17,23 @@ router.post("/", async (req, res) => {
   try {
     const medline = await lookupMedlinePlus(diagnosis);
 
-    // NOTE: real Claude API call goes here, using process.env.ANTHROPIC_API_KEY
-    // and the anthropic-version header, since this is now a real standalone
-    // server (not the in-chat artifact bridge, which needed neither).
-    // Wiring the actual call is the one piece left for you to complete with
-    // your own API key from console.anthropic.com — see server.js comment.
+    // Ground each ACTIVE medication against RxNorm (NIH) — confirms the name
+    // is a real, recognized drug and surfaces its official RxNorm-listed
+    // name/strength, which we hand to the model as reference, not a
+    // replacement for a licensed dosing source.
+    const activeMedNames = meds.filter((m) => m.name && m.status !== "inactive").map((m) => m.name);
+    const rxnormResults = {};
+    for (const medName of activeMedNames) {
+      rxnormResults[medName] = await searchRxNorm(medName, 3);
+    }
+
     const generated = await callClaudeToGenerateFactSheet({
       diagnosis,
       careContext,
       readingLevel,
       language,
       medlineContext: medline,
+      rxnormContext: rxnormResults,
       body: req.body,
     });
 
@@ -41,7 +47,7 @@ router.post("/", async (req, res) => {
 
     logAudit(id, "generated", requestedBy, { diagnosis, careContext, groundedInMedlinePlus: !!medline });
 
-    res.json({ id, status: "draft", content: generated, medlineGrounding: medline });
+    res.json({ id, status: "draft", content: generated, medlineGrounding: medline, rxnormGrounding: rxnormResults });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message || "Generation failed" });
@@ -113,7 +119,7 @@ router.post("/:id/approve", (req, res) => {
 // Real Google Gemini API call — requires GEMINI_API_KEY in your .env file.
 // Uses Gemini's free tier (Flash model): no credit card required.
 // Get a key at https://aistudio.google.com/apikey
-async function callClaudeToGenerateFactSheet({ diagnosis, careContext, readingLevel, language, medlineContext, body }) {
+async function callClaudeToGenerateFactSheet({ diagnosis, careContext, readingLevel, language, medlineContext, rxnormContext, body }) {
   const { meds = [], labs = [], allergies = "", dietTags = [], patientAge, patientSex } = body;
 
   const CARE_FRAMING = {
@@ -127,6 +133,21 @@ async function callClaudeToGenerateFactSheet({ diagnosis, careContext, readingLe
   const grounding = medlineContext
     ? `Reference from MedlinePlus on "${medlineContext.title}": ${medlineContext.snippet}\nUse this as grounding, restated in your own words — do not quote directly.`
     : `No MedlinePlus reference found — rely on well-established mainstream clinical knowledge and be conservative.`;
+
+  // RxNorm (NIH) confirms each medication is a real, recognized drug name
+  // and its official listed strength/form. This is a name/existence check,
+  // NOT a dosing authority — it tells the model "this drug name is real
+  // and commonly comes in these forms," not "this is the correct dose for
+  // this patient." The model is told that explicitly below.
+  const rxnormLines = Object.entries(rxnormContext || {})
+    .map(([medName, matches]) => {
+      if (!matches || matches.length === 0) return `- "${medName}": not found in RxNorm — verify this is a real, correctly-spelled medication name.`;
+      return `- "${medName}" matches RxNorm entries: ${matches.join(" | ")}`;
+    })
+    .join("\n");
+  const medGrounding = rxnormLines
+    ? `RxNorm (NIH) medication name check:\n${rxnormLines}\nThis confirms drug names/forms exist — it is NOT a dosing source. Never state a specific dose as "confirmed" or "verified" based on this; only use doses the physician actually entered above.`
+    : "";
 
   const systemPrompt = `You are a clinical patient-education assistant drafting a discharge fact sheet as a scannable "cheat sheet" poster. Output is ALWAYS reviewed by a physician before reaching a patient.
 
@@ -153,6 +174,8 @@ Labs:
 ${labList}
 
 ${grounding}
+
+${medGrounding}
 
 Generate the fact sheet JSON now.`;
 
