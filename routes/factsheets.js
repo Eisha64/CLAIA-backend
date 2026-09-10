@@ -1,6 +1,6 @@
 const express = require("express");
 const crypto = require("crypto");
-const { db, logAudit } = require("../db");
+const { pool, logAudit } = require("../db");
 const { lookupMedlinePlus, searchRxNorm } = require("../lib/grounding");
 
 const router = express.Router();
@@ -40,12 +40,13 @@ router.post("/", async (req, res) => {
     const id = crypto.randomUUID();
     const now = new Date().toISOString();
 
-    db.prepare(
+    await pool.query(
       `INSERT INTO fact_sheets (id, patient_diagnosis, care_context, reading_level, language, content_json, status, created_at, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?)`
-    ).run(id, diagnosis, careContext, readingLevel, language, JSON.stringify(generated), now, requestedBy || "unknown");
+       VALUES ($1, $2, $3, $4, $5, $6, 'draft', $7, $8)`,
+      [id, diagnosis, careContext, readingLevel, language, JSON.stringify(generated), now, requestedBy || "unknown"]
+    );
 
-    logAudit(id, "generated", requestedBy, { diagnosis, careContext, groundedInMedlinePlus: !!medline });
+    await logAudit(id, "generated", requestedBy, { diagnosis, careContext, groundedInMedlinePlus: !!medline });
 
     res.json({ id, status: "draft", content: generated, medlineGrounding: medline, rxnormGrounding: rxnormResults });
   } catch (err) {
@@ -56,64 +57,85 @@ router.post("/", async (req, res) => {
 
 // --- Get a fact sheet + its full audit history ---
 // GET /api/factsheets/:id
-router.get("/:id", (req, res) => {
-  const sheet = db.prepare(`SELECT * FROM fact_sheets WHERE id = ?`).get(req.params.id);
-  if (!sheet) return res.status(404).json({ error: "not found" });
-  const history = db
-    .prepare(`SELECT action, actor, detail_json, occurred_at FROM audit_log WHERE fact_sheet_id = ? ORDER BY occurred_at ASC`)
-    .all(req.params.id);
-  logAudit(req.params.id, "viewed", req.query.viewer || "unknown");
-  res.json({ ...sheet, content: JSON.parse(sheet.content_json), history });
+router.get("/:id", async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT * FROM fact_sheets WHERE id = $1`, [req.params.id]);
+    const sheet = result.rows[0];
+    if (!sheet) return res.status(404).json({ error: "not found" });
+    const historyResult = await pool.query(
+      `SELECT action, actor, detail_json, occurred_at FROM audit_log WHERE fact_sheet_id = $1 ORDER BY occurred_at ASC`,
+      [req.params.id]
+    );
+    await logAudit(req.params.id, "viewed", req.query.viewer || "unknown");
+    res.json({ ...sheet, content: JSON.parse(sheet.content_json), history: historyResult.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message || "Lookup failed" });
+  }
 });
 
 // --- Edit a section (logs a real before/after diff, reopens if previously approved) ---
 // PUT /api/factsheets/:id/section
 // body: { sectionKey, newValue, editedBy }
-router.put("/:id/section", (req, res) => {
-  const { sectionKey, newValue, editedBy } = req.body;
-  const sheet = db.prepare(`SELECT * FROM fact_sheets WHERE id = ?`).get(req.params.id);
-  if (!sheet) return res.status(404).json({ error: "not found" });
+router.put("/:id/section", async (req, res) => {
+  try {
+    const { sectionKey, newValue, editedBy } = req.body;
+    const result = await pool.query(`SELECT * FROM fact_sheets WHERE id = $1`, [req.params.id]);
+    const sheet = result.rows[0];
+    if (!sheet) return res.status(404).json({ error: "not found" });
 
-  const content = JSON.parse(sheet.content_json);
-  const before = content.sections?.[sectionKey];
-  content.sections[sectionKey] = newValue;
+    const content = JSON.parse(sheet.content_json);
+    const before = content.sections?.[sectionKey];
+    content.sections[sectionKey] = newValue;
 
-  const wasApproved = sheet.status === "approved";
-  const newStatus = "draft"; // any edit reopens for re-approval — this IS the correct behavior, not a bug
+    const wasApproved = sheet.status === "approved";
+    const newStatus = "draft"; // any edit reopens for re-approval — this IS the correct behavior, not a bug
 
-  db.prepare(`UPDATE fact_sheets SET content_json = ?, status = ?, approved_by = NULL, approved_at = NULL WHERE id = ?`)
-    .run(JSON.stringify(content), newStatus, req.params.id);
+    await pool.query(
+      `UPDATE fact_sheets SET content_json = $1, status = $2, approved_by = NULL, approved_at = NULL WHERE id = $3`,
+      [JSON.stringify(content), newStatus, req.params.id]
+    );
 
-  logAudit(req.params.id, wasApproved ? "reopened" : "edited", editedBy, {
-    section: sectionKey,
-    before,
-    after: newValue,
-    reopenedFromApproved: wasApproved,
-  });
+    await logAudit(req.params.id, wasApproved ? "reopened" : "edited", editedBy, {
+      section: sectionKey,
+      before,
+      after: newValue,
+      reopenedFromApproved: wasApproved,
+    });
 
-  res.json({ id: req.params.id, status: newStatus, content });
+    res.json({ id: req.params.id, status: newStatus, content });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message || "Edit failed" });
+  }
 });
 
 // --- Approve (the actual sign-off gate) ---
 // POST /api/factsheets/:id/approve
 // body: { approvedBy }
-router.post("/:id/approve", (req, res) => {
-  const { approvedBy } = req.body;
-  if (!approvedBy || !approvedBy.trim()) {
-    return res.status(400).json({ error: "approvedBy is required — no anonymous approvals" });
+router.post("/:id/approve", async (req, res) => {
+  try {
+    const { approvedBy } = req.body;
+    if (!approvedBy || !approvedBy.trim()) {
+      return res.status(400).json({ error: "approvedBy is required — no anonymous approvals" });
+    }
+    const result = await pool.query(`SELECT * FROM fact_sheets WHERE id = $1`, [req.params.id]);
+    const sheet = result.rows[0];
+    if (!sheet) return res.status(404).json({ error: "not found" });
+
+    const now = new Date().toISOString();
+    await pool.query(`UPDATE fact_sheets SET status = 'approved', approved_by = $1, approved_at = $2 WHERE id = $3`, [
+      approvedBy,
+      now,
+      req.params.id,
+    ]);
+    await logAudit(req.params.id, "approved", approvedBy, { approvedAt: now });
+
+    res.json({ id: req.params.id, status: "approved", approvedBy, approvedAt: now });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message || "Approval failed" });
   }
-  const sheet = db.prepare(`SELECT * FROM fact_sheets WHERE id = ?`).get(req.params.id);
-  if (!sheet) return res.status(404).json({ error: "not found" });
-
-  const now = new Date().toISOString();
-  db.prepare(`UPDATE fact_sheets SET status = 'approved', approved_by = ?, approved_at = ? WHERE id = ?`).run(
-    approvedBy,
-    now,
-    req.params.id
-  );
-  logAudit(req.params.id, "approved", approvedBy, { approvedAt: now });
-
-  res.json({ id: req.params.id, status: "approved", approvedBy, approvedAt: now });
 });
 
 // Real Google Gemini API call — requires GEMINI_API_KEY in your .env file.
@@ -218,5 +240,35 @@ Generate the fact sheet JSON now.`;
 
   return JSON.parse(cleaned);
 }
+
+// --- Public, read-only view for patients ---
+// GET /api/factsheets/:id/public
+// Only ever returns APPROVED sheets, with a minimal patient-facing shape —
+// never exposes drafts, internal audit history, or who requested generation.
+router.get("/:id/public", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT patient_diagnosis, care_context, content_json, status, approved_by, approved_at FROM fact_sheets WHERE id = $1`,
+      [req.params.id]
+    );
+    const sheet = result.rows[0];
+    // Deliberately vague error for both "doesn't exist" and "not approved yet" —
+    // don't leak which case it is to an unauthenticated visitor.
+    if (!sheet || sheet.status !== "approved") {
+      return res.status(404).json({ error: "This fact sheet is not available." });
+    }
+    await logAudit(req.params.id, "viewed_by_patient", "patient_link", {});
+    res.json({
+      diagnosis: sheet.patient_diagnosis,
+      careContext: sheet.care_context,
+      content: JSON.parse(sheet.content_json),
+      approvedBy: sheet.approved_by,
+      approvedAt: sheet.approved_at,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Something went wrong loading this." });
+  }
+});
 
 module.exports = router;
