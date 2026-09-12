@@ -2,7 +2,7 @@ const express = require("express");
 const crypto = require("crypto");
 const { pool, logAudit } = require("../db");
 const { lookupMedlinePlus, searchRxNorm } = require("../lib/grounding");
-const { getMedicationSafetyRules, interpretLabs, interpretBloodPressure } = require("../lib/clinicalRules");
+const { getMedicationSafetyRules, interpretLabs, interpretBloodPressure, getCombinationRisks } = require("../lib/clinicalRules");
 
 const router = express.Router();
 
@@ -34,6 +34,7 @@ router.post("/", async (req, res) => {
     const medSafetyRules = getMedicationSafetyRules(activeMedNames);
     const labInterpretations = interpretLabs(labs);
     const bpInterpretation = interpretBloodPressure(labs);
+    const combinationRisks = getCombinationRisks(activeMedNames, labInterpretations, bpInterpretation);
 
     const generated = await callClaudeToGenerateFactSheet({
       diagnosis,
@@ -45,6 +46,7 @@ router.post("/", async (req, res) => {
       medSafetyRules,
       labInterpretations,
       bpInterpretation,
+      combinationRisks,
       body: req.body,
     });
 
@@ -65,7 +67,7 @@ router.post("/", async (req, res) => {
       content: generated,
       medlineGrounding: medline,
       rxnormGrounding: rxnormResults,
-      clinicalFindings: { medSafetyRules, labInterpretations, bpInterpretation },
+      clinicalFindings: { medSafetyRules, labInterpretations, bpInterpretation, combinationRisks },
     });
   } catch (err) {
     console.error(err);
@@ -159,7 +161,7 @@ router.post("/:id/approve", async (req, res) => {
 // Real Google Gemini API call — requires GEMINI_API_KEY in your .env file.
 // Uses Gemini's free tier (Flash model): no credit card required.
 // Get a key at https://aistudio.google.com/apikey
-async function callClaudeToGenerateFactSheet({ diagnosis, careContext, readingLevel, language, medlineContext, rxnormContext, medSafetyRules, labInterpretations, bpInterpretation, body }) {
+async function callClaudeToGenerateFactSheet({ diagnosis, careContext, readingLevel, language, medlineContext, rxnormContext, medSafetyRules, labInterpretations, bpInterpretation, combinationRisks, body }) {
   const { meds = [], labs = [], allergies = "", dietTags = [], patientAge, patientSex } = body;
 
   const CARE_FRAMING = {
@@ -200,10 +202,20 @@ async function callClaudeToGenerateFactSheet({ diagnosis, careContext, readingLe
   const bpFinding = bpInterpretation ? `- Blood pressure: ${bpInterpretation.level.toUpperCase()} — ${bpInterpretation.note}` : "";
   const allFindings = [labFindings, bpFinding].filter(Boolean).join("\n");
 
+  const urgentCombos = (combinationRisks || []).filter((r) => r.severity === "urgent");
+  const moderateCombos = (combinationRisks || []).filter((r) => r.severity !== "urgent");
+  const combinationBlock = (combinationRisks || []).length
+    ? `MANDATORY combination-risk findings — these are calculated by checking multiple medications/labs TOGETHER, not individually, and represent risks that only emerge from the combination. These are more important than individual medication mentions:
+${urgentCombos.map((r) => `- [URGENT — MUST go in the redFlags section] ${r.title}: ${r.mustInclude}`).join("\n")}
+${moderateCombos.map((r) => `- [Include in medications or redFlags, whichever fits] ${r.title}: ${r.mustInclude}`).join("\n")}`
+    : "";
+
   const clinicalRulesBlock = `
 ${requiredSafetyPoints ? `MANDATORY medication safety education — these are calculated from the medications entered (per ADA/AHA-style standard-of-care patient counseling points), NOT optional, and must be reflected somewhere in the sheet (medications section and/or redFlags section, whichever fits better):\n${requiredSafetyPoints}` : ""}
 
-${allFindings ? `MANDATORY lab/vital interpretation — these classifications are pre-calculated against standard guideline reference ranges (ADA/AHA/KDIGO), not for you to derive yourself. If any are "BORDERLINE", treat this as a real, worth-flagging finding — do not downplay it as unimportant just because it isn't as severe as a fully abnormal value; borderline values are exactly where lifestyle-change counseling has the most impact:\n${allFindings}` : ""}`;
+${allFindings ? `MANDATORY lab/vital interpretation — these classifications are pre-calculated against standard guideline reference ranges (ADA/AHA/KDIGO), not for you to derive yourself. If any are "BORDERLINE", treat this as a real, worth-flagging finding — do not downplay it as unimportant just because it isn't as severe as a fully abnormal value; borderline values are exactly where lifestyle-change counseling has the most impact:\n${allFindings}` : ""}
+
+${combinationBlock}`;
 
   const systemPrompt = `You are a clinical patient-education assistant drafting a discharge fact sheet as a scannable "cheat sheet" poster. Output is ALWAYS reviewed by a physician before reaching a patient.
 
@@ -247,34 +259,59 @@ Generate the fact sheet JSON now.`;
   const MODEL = "gemini-3.6-flash";
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      systemInstruction: { parts: [{ text: systemPrompt }] },
-      contents: [{ parts: [{ text: userPrompt }] }],
-      generationConfig: { maxOutputTokens: 4000, temperature: 0.4 },
-    }),
-  });
+  // Malformed JSON from the model is usually a transient quirk (it added
+  // stray text, or got cut off oddly), not a persistent failure — retrying
+  // the exact same request usually succeeds on attempt 2 or 3. This
+  // directly fixes the "3 errors before it worked" friction: instead of
+  // making you click Generate again each time, we do that automatically,
+  // silently, before giving up.
+  const MAX_ATTEMPTS = 3;
+  let lastError;
 
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`Gemini API error ${response.status}: ${errText.slice(0, 300)}`);
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: systemPrompt }] },
+          contents: [{ parts: [{ text: userPrompt }] }],
+          generationConfig: { maxOutputTokens: 4000, temperature: 0.4 },
+        }),
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Gemini API error ${response.status}: ${errText.slice(0, 300)}`);
+      }
+
+      const data = await response.json();
+      const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (!rawText) {
+        const blockReason = data.candidates?.[0]?.finishReason;
+        throw new Error(`No text in Gemini response${blockReason ? ` (finishReason: ${blockReason})` : ""}.`);
+      }
+
+      let cleaned = rawText.trim().replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
+      const firstBrace = cleaned.indexOf("{");
+      const lastBrace = cleaned.lastIndexOf("}");
+      if (firstBrace !== -1 && lastBrace !== -1) cleaned = cleaned.slice(firstBrace, lastBrace + 1);
+
+      const parsed = JSON.parse(cleaned); // throws on malformed JSON -> caught below, triggers retry
+      if (attempt > 1) console.log(`[generate] Succeeded on attempt ${attempt} after malformed JSON on earlier attempt(s).`);
+      return parsed;
+    } catch (err) {
+      lastError = err;
+      console.warn(`[generate] Attempt ${attempt}/${MAX_ATTEMPTS} failed: ${err.message}`);
+      // Don't retry on a genuine API error (bad key, quota, etc.) — only
+      // retry on parse-related failures, which are the transient kind.
+      if (err.message.startsWith("Gemini API error") || err.message.startsWith("GEMINI_API_KEY")) {
+        throw err;
+      }
+    }
   }
 
-  const data = await response.json();
-  const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!rawText) {
-    const blockReason = data.candidates?.[0]?.finishReason;
-    throw new Error(`No text in Gemini response${blockReason ? ` (finishReason: ${blockReason})` : ""}.`);
-  }
-
-  let cleaned = rawText.trim().replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
-  const firstBrace = cleaned.indexOf("{");
-  const lastBrace = cleaned.lastIndexOf("}");
-  if (firstBrace !== -1 && lastBrace !== -1) cleaned = cleaned.slice(firstBrace, lastBrace + 1);
-
-  return JSON.parse(cleaned);
+  throw new Error(`Failed after ${MAX_ATTEMPTS} attempts. Last error: ${lastError.message}`);
 }
 
 // --- Public, read-only view for patients ---
@@ -284,7 +321,7 @@ Generate the fact sheet JSON now.`;
 router.get("/:id/public", async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT patient_diagnosis, care_context, content_json, status, approved_by, approved_at FROM fact_sheets WHERE id = $1`,
+      `SELECT patient_diagnosis, care_context, language, content_json, status, approved_by, approved_at FROM fact_sheets WHERE id = $1`,
       [req.params.id]
     );
     const sheet = result.rows[0];
@@ -297,6 +334,7 @@ router.get("/:id/public", async (req, res) => {
     res.json({
       diagnosis: sheet.patient_diagnosis,
       careContext: sheet.care_context,
+      language: sheet.language,
       content: JSON.parse(sheet.content_json),
       approvedBy: sheet.approved_by,
       approvedAt: sheet.approved_at,
