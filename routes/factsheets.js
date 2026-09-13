@@ -8,15 +8,27 @@ const router = express.Router();
 
 // --- Generate a new draft fact sheet ---
 // POST /api/factsheets
-// body: { diagnosis, careContext, readingLevel, language, meds, labs, allergies, dietTags, requestedBy }
+// body: { diagnoses: [string], careContext, readingLevel, language, meds, labs, allergies, dietTags, requestedBy }
+// "diagnoses" is an array — supports patients with multiple/comorbid
+// conditions, producing ONE integrated sheet rather than one sheet per
+// diagnosis (see the prompt instructions below for why: separate sheets
+// for a diabetic+CKD patient risk giving contradictory diet advice with
+// no way for the patient to reconcile them).
 router.post("/", async (req, res) => {
-  const { diagnosis, careContext, readingLevel, language, requestedBy, meds = [], labs = [] } = req.body;
-  if (!diagnosis || !diagnosis.trim()) {
-    return res.status(400).json({ error: "diagnosis is required" });
+  const { careContext, readingLevel, language, requestedBy, meds = [], labs = [] } = req.body;
+  const diagnoses = (req.body.diagnoses || []).map((d) => (d || "").trim()).filter(Boolean);
+
+  if (diagnoses.length === 0) {
+    return res.status(400).json({ error: "at least one diagnosis is required" });
   }
 
   try {
-    const medline = await lookupMedlinePlus(diagnosis);
+    // Ground EACH diagnosis against MedlinePlus independently.
+    const medlineResults = [];
+    for (const dx of diagnoses) {
+      const result = await lookupMedlinePlus(dx);
+      if (result) medlineResults.push({ diagnosis: dx, ...result });
+    }
 
     // Ground each ACTIVE medication against RxNorm (NIH) — confirms the name
     // is a real, recognized drug and surfaces its official RxNorm-listed
@@ -37,11 +49,11 @@ router.post("/", async (req, res) => {
     const combinationRisks = getCombinationRisks(activeMedNames, labInterpretations, bpInterpretation);
 
     const generated = await callClaudeToGenerateFactSheet({
-      diagnosis,
+      diagnoses,
       careContext,
       readingLevel,
       language,
-      medlineContext: medline,
+      medlineResults,
       rxnormContext: rxnormResults,
       medSafetyRules,
       labInterpretations,
@@ -52,20 +64,21 @@ router.post("/", async (req, res) => {
 
     const id = crypto.randomUUID();
     const now = new Date().toISOString();
+    const diagnosisDisplay = diagnoses.join(", ");
 
     await pool.query(
       `INSERT INTO fact_sheets (id, patient_diagnosis, care_context, reading_level, language, content_json, status, created_at, created_by)
        VALUES ($1, $2, $3, $4, $5, $6, 'draft', $7, $8)`,
-      [id, diagnosis, careContext, readingLevel, language, JSON.stringify(generated), now, requestedBy || "unknown"]
+      [id, diagnosisDisplay, careContext, readingLevel, language, JSON.stringify(generated), now, requestedBy || "unknown"]
     );
 
-    await logAudit(id, "generated", requestedBy, { diagnosis, careContext, groundedInMedlinePlus: !!medline });
+    await logAudit(id, "generated", requestedBy, { diagnoses, careContext, medlineMatchCount: medlineResults.length });
 
     res.json({
       id,
       status: "draft",
       content: generated,
-      medlineGrounding: medline,
+      medlineGrounding: medlineResults,
       rxnormGrounding: rxnormResults,
       clinicalFindings: { medSafetyRules, labInterpretations, bpInterpretation, combinationRisks },
     });
@@ -161,7 +174,7 @@ router.post("/:id/approve", async (req, res) => {
 // Real Google Gemini API call — requires GEMINI_API_KEY in your .env file.
 // Uses Gemini's free tier (Flash model): no credit card required.
 // Get a key at https://aistudio.google.com/apikey
-async function callClaudeToGenerateFactSheet({ diagnosis, careContext, readingLevel, language, medlineContext, rxnormContext, medSafetyRules, labInterpretations, bpInterpretation, combinationRisks, body }) {
+async function callClaudeToGenerateFactSheet({ diagnoses, careContext, readingLevel, language, medlineResults, rxnormContext, medSafetyRules, labInterpretations, bpInterpretation, combinationRisks, body }) {
   const { meds = [], labs = [], allergies = "", dietTags = [], patientAge, patientSex } = body;
 
   const CARE_FRAMING = {
@@ -172,9 +185,14 @@ async function callClaudeToGenerateFactSheet({ diagnosis, careContext, readingLe
 
   const medList = meds.filter((m) => m.name && m.status !== "inactive").map((m) => `- ${m.name}${m.dose ? ` (${m.dose})` : ""}`).join("\n") || "None listed";
   const labList = labs.filter((l) => l.name).map((l) => `- ${l.name}: ${l.value || "n/a"} [${l.flag}]`).join("\n") || "None listed";
-  const grounding = medlineContext
-    ? `Reference from MedlinePlus on "${medlineContext.title}": ${medlineContext.snippet}\nUse this as grounding, restated in your own words — do not quote directly.`
-    : `No MedlinePlus reference found — rely on well-established mainstream clinical knowledge and be conservative.`;
+
+  const grounding = (medlineResults || []).length
+    ? (medlineResults || [])
+        .map((m) => `- On "${m.diagnosis}", MedlinePlus reference "${m.title}": ${m.snippet}\n  Use this as grounding, restated in your own words — do not quote directly.`)
+        .join("\n")
+    : `No MedlinePlus reference found for any of the diagnoses — rely on well-established mainstream clinical knowledge and be conservative.`;
+  const unmatchedDx = diagnoses.filter((dx) => !(medlineResults || []).some((m) => m.diagnosis === dx));
+  const groundingNote = unmatchedDx.length ? `\n(No MedlinePlus match for: ${unmatchedDx.join(", ")} — use general clinical knowledge for these, conservatively.)` : "";
 
   // RxNorm (NIH) confirms each medication is a real, recognized drug name
   // and its official listed strength/form. This is a name/existence check,
@@ -217,9 +235,18 @@ ${allFindings ? `MANDATORY lab/vital interpretation — these classifications ar
 
 ${combinationBlock}`;
 
+  const isMultiDx = diagnoses.length > 1;
+  const multiDxInstruction = isMultiDx
+    ? `\nThis patient has MULTIPLE diagnoses at once: ${diagnoses.join(", ")}. Write ONE integrated sheet for the whole patient, not separate disconnected sections per diagnosis. Specifically:
+- "overview": briefly address each diagnosis and, if relevant, how they relate to each other (e.g., one condition affecting management of another).
+- "diet" and "lifestyle": if guidance for one diagnosis could conflict with another (e.g., a general diabetes diet vs. a kidney-disease potassium/protein restriction), you MUST explicitly reconcile this — state the combined, actually-correct guidance for THIS patient, not generic advice for either condition in isolation. Never present two pieces of advice that contradict each other without resolving which one actually applies.
+- "diagnosisLabel": a short combined label covering all conditions (e.g. "Diabetes & Kidney Disease"), not just the first one.`
+    : "";
+
   const systemPrompt = `You are a clinical patient-education assistant drafting a discharge fact sheet as a scannable "cheat sheet" poster. Output is ALWAYS reviewed by a physician before reaching a patient.
 
 ${CARE_FRAMING[careContext] || CARE_FRAMING.discharge}
+${multiDxInstruction}
 
 Rules:
 - Write at a ${readingLevel} reading level, in ${language}.
@@ -231,7 +258,7 @@ Rules:
 - Respond with ONLY valid JSON, no markdown fences:
 {"diagnosisLabel":"string","sections":{"overview":{"highlight":"string|null","bullets":[{"label":"string","detail":"string"}]},"medications":{...},"diet":{...},"lifestyle":{...},"dos":{...},"donts":{...},"redFlags":{...}}}`;
 
-  const userPrompt = `Diagnosis: ${diagnosis}
+  const userPrompt = `Diagnosis/diagnoses: ${diagnoses.join(", ")}
 Age/Sex: ${patientAge || "n/a"} / ${patientSex || "n/a"}
 Allergies: ${allergies || "None listed"}
 Dietary/cultural context: ${dietTags.join(", ") || "None specified"}
@@ -242,7 +269,7 @@ ${medList}
 Labs:
 ${labList}
 
-${grounding}
+${grounding}${groundingNote}
 
 ${medGrounding}
 ${clinicalRulesBlock}
