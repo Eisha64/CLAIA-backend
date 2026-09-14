@@ -303,7 +303,12 @@ Generate the fact sheet JSON now.`;
         body: JSON.stringify({
           systemInstruction: { parts: [{ text: systemPrompt }] },
           contents: [{ parts: [{ text: userPrompt }] }],
-          generationConfig: { maxOutputTokens: 4000, temperature: 0.4 },
+          // Raised from 4000: multi-diagnosis reconciliation + mandatory
+          // safety/lab/combination content can genuinely need more room
+          // than a single-diagnosis sheet. Retrying with the SAME ceiling
+          // just truncates again in the same place — this is a capacity
+          // fix, not a random-glitch fix.
+          generationConfig: { maxOutputTokens: 8000, temperature: 0.4 },
         }),
       });
 
@@ -313,10 +318,16 @@ Generate the fact sheet JSON now.`;
       }
 
       const data = await response.json();
+      const finishReason = data.candidates?.[0]?.finishReason;
       const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+
       if (!rawText) {
-        const blockReason = data.candidates?.[0]?.finishReason;
-        throw new Error(`No text in Gemini response${blockReason ? ` (finishReason: ${blockReason})` : ""}.`);
+        throw new Error(`No text in Gemini response${finishReason ? ` (finishReason: ${finishReason})` : ""}.`);
+      }
+      if (finishReason === "MAX_TOKENS") {
+        // Explicit, honest signal instead of letting this surface as a
+        // confusing "Expected ',' or '}'" JSON error further down.
+        throw new Error("Response was cut off (hit the token limit) — this request needed more room than allotted. Retrying with the same limit won't help; see server logs.");
       }
 
       let cleaned = rawText.trim().replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
